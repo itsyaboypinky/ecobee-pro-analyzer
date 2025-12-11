@@ -1,4 +1,4 @@
-import streamlit as st
+import streamlit as stimport streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -32,7 +32,6 @@ def load_data(file):
 def create_motion_timeline(df, columns, title="Motion / Occupancy Timeline"):
     """
     Creates a Plotly Gantt-style chart showing duration of motion events.
-    (Includes improved hover label styling for better readability)
     """
     fig = go.Figure()
     colors = px.colors.qualitative.Plotly
@@ -71,7 +70,6 @@ def create_motion_timeline(df, columns, title="Motion / Occupancy Timeline"):
                 name=col,
                 showlegend=(s == starts[0]),
                 hoveron='fills',
-                # Custom data for precise start, end, and duration
                 customdata=[[s.strftime("%H:%M"), e.strftime("%H:%M"), duration_minutes]],
                 hovertemplate=f"<b>{col} Active</b><br>Start: %{{customdata[0]}}<br>End: %{{customdata[1]}}<br>Duration: %{{customdata[2]}} min<extra></extra>"
             ))
@@ -88,14 +86,7 @@ def create_motion_timeline(df, columns, title="Motion / Occupancy Timeline"):
         xaxis_title="Time",
         legend_title="Sensors",
         margin=dict(t=60, b=20),
-        
-        # IMPROVEMENT: Enhanced Hover Label Styling for Readability
-        hoverlabel=dict(
-            bgcolor="black",            
-            font_size=14,               
-            font_color="white",         
-            font_family="Arial, sans-serif"
-        )
+        hoverlabel=dict(bgcolor="black", font_size=14, font_color="white")
     )
     return fig
 
@@ -170,9 +161,7 @@ if uploaded_file is not None:
         # === TEMPERATURE ===
         st.header("🌡️ Temperature Profiles")
         if selected_rooms:
-            # Resample all temperature and setpoint data for consistent plotting points
             plot_df = df[selected_rooms].resample('5min').mean()
-
             fig = px.line(plot_df, render_mode='webgl')
             
             if 'Heat Set Temp (F)' in df.columns:
@@ -205,7 +194,7 @@ if uploaded_file is not None:
             st.info("No air quality data found (available only on Ecobee Premium models).")
 
         # === MOTION TIMELINE ===
-        st.header("🏃 Motion Detection Timeline (Duration View)")
+        st.header("🏃 Motion Detection Timeline")
         if motion_cols:
             selected_motion = st.multiselect("Select sensors", motion_cols, default=motion_cols)
             if selected_motion:
@@ -223,44 +212,104 @@ if uploaded_file is not None:
         with col1:
             st.subheader("Outdoor Conditions")
             fig_out = go.Figure()
-
             has_outdoor = False
             if 'Outdoor Temp (F)' in df.columns:
                 fig_out.add_trace(go.Scatter(x=df.index, y=df['Outdoor Temp (F)'], name='Outdoor Temp (°F)', line=dict(color='orange', width=2.5), yaxis='y1'))
-                fig_out.update_layout(yaxis=dict(title="Temperature (°F)", showgrid=False))
                 has_outdoor = True
-
             if 'Wind Speed (km/h)' in df.columns:
                 fig_out.add_trace(go.Scatter(x=df.index, y=df['Wind Speed (km/h)'], name='Wind Speed (km/h)', yaxis='y2', line=dict(color='gray', width=2, dash='dot')))
-                fig_out.update_layout(yaxis2=dict(title="Wind Speed (km/h)", overlaying="y", side="right", showgrid=False))
                 has_outdoor = True
-
+            
             if has_outdoor:
-                fig_out.update_layout(title="Outdoor Weather", hovermode="x unified", height=420, margin=dict(t=60, b=40), legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+                fig_out.update_layout(title="Outdoor Weather", hovermode="x unified", height=420, yaxis=dict(title="Temp"), yaxis2=dict(title="Wind", overlaying="y", side="right"))
                 st.plotly_chart(fig_out, use_container_width=True)
             else:
-                st.info("No outdoor weather data found in this file")
+                st.info("No outdoor weather data found.")
 
         with col2:
             st.subheader("Indoor Humidity")
             humidity_cols = [col for col in df.columns if any(x in col.lower() for x in ['humidity', '%rh'])]
-            
             if humidity_cols:
                 default_hum = humidity_cols if len(humidity_cols) <= 3 else humidity_cols[:2]
                 selected_hum = st.multiselect("Select Humidity Sensors", options=humidity_cols, default=default_hum, key="humidity_select")
-                
                 if selected_hum:
                     fig_hum = px.line(df[selected_hum].resample('5min').mean(), title="Indoor Relative Humidity", color_discrete_sequence=['#636EFA', '#00CC96', '#EF553B'])
-                    fig_hum.update_layout(hovermode="x unified", yaxis_title="Humidity (%RH)", height=420, margin=dict(t=60, b=40), legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+                    fig_hum.update_layout(height=420)
                     st.plotly_chart(fig_hum, use_container_width=True)
-                else:
-                    st.info("No humidity sensors selected")
             else:
-                st.info("No indoor humidity data found (check non-Premium Ecobee models)")
+                st.info("No indoor humidity data found.")
+
+        # ==========================================
+        # === NEW SECTION: ROOM BALANCING SCORES ===
+        # ==========================================
+        st.divider()
+        st.header("⚖️ Room Temperature Balancing")
+        
+        # Identify Room Sensors (exclude Outdoor, Setpoints, Min/Max columns)
+        room_cols = [c for c in temp_cols if 'Outdoor' not in c and 'Set Temp' not in c and 'Zone' not in c]
+        
+        # Try to identify the Main Thermostat to use as a baseline
+        # Ecobee usually names it 'Thermostat Temperature (F)'
+        thermostat_col = next((c for c in room_cols if 'Thermostat' in c), None)
+
+        if thermostat_col and len(room_cols) > 1:
+            st.write(f"Comparing all rooms against **{thermostat_col}** (Baseline).")
+            
+            # 1. Calculate Average Temperature for entire period
+            avg_temps = df[room_cols].mean()
+            baseline_temp = avg_temps[thermostat_col]
+            
+            # 2. Calculate Offsets (Room - Thermostat)
+            offsets = avg_temps - baseline_temp
+            offsets = offsets.drop(thermostat_col) # Remove the baseline itself from the chart
+            
+            # 3. Create DataFrame for Plotting
+            score_df = pd.DataFrame({'Sensor': offsets.index, 'Offset': offsets.values})
+            
+            # 4. Visualization: Diverging Bar Chart
+            fig_bal = px.bar(score_df, x='Offset', y='Sensor', orientation='h',
+                             title="Average Temperature Offset vs Main Thermostat",
+                             color='Offset',
+                             color_continuous_scale='RdBu_r', # Red=Hot, Blue=Cold
+                             text_auto='.1f')
+            
+            fig_bal.update_layout(xaxis_title="Offset (°F) [Negative = Cooler, Positive = Warmer]", 
+                                  yaxis_title=None)
+            fig_bal.add_vline(x=0, line_dash="solid", line_color="black")
+            st.plotly_chart(fig_bal, use_container_width=True)
+            
+            # 5. Recommendations
+            col_rec1, col_rec2 = st.columns(2)
+            
+            with col_rec1:
+                st.subheader("🔥 Rooms Running Hot")
+                hot_rooms = score_df[score_df['Offset'] > 1.0] # Threshold: 1 degree warmer
+                if not hot_rooms.empty:
+                    for idx, row in hot_rooms.iterrows():
+                        st.warning(f"**{row['Sensor']}** (+{row['Offset']:.1f}°F)")
+                    st.markdown("👉 **Action:** Partially close vents in these rooms to force air to cooler rooms.")
+                else:
+                    st.success("No rooms are significantly overheating.")
+
+            with col_rec2:
+                st.subheader("❄️ Rooms Running Cold")
+                cold_rooms = score_df[score_df['Offset'] < -1.0] # Threshold: 1 degree cooler
+                if not cold_rooms.empty:
+                    for idx, row in cold_rooms.iterrows():
+                        st.info(f"**{row['Sensor']}** ({row['Offset']:.1f}°F)")
+                    st.markdown("👉 **Action:** Ensure vents are fully open. Check windows for drafts.")
+                else:
+                    st.success("No rooms are significantly overcooling.")
+                    
+        elif len(room_cols) <= 1:
+            st.warning("Not enough sensors found to calculate balancing scores. You need at least one remote SmartSensor.")
+        else:
+            st.error("Could not identify the main 'Thermostat Temperature' column to use as a baseline.")
 
         st.success("Your Ecobee Pro Analyzer is complete — enjoy your smart home insights!")
 
     else:
         st.error("Could not process the uploaded CSV file. Please check file format.")
 else:
+    st.info("Upload your Ecobee CSV data export to begin the analysis.")
     st.info("Upload your Ecobee CSV data export to begin the analysis.")
