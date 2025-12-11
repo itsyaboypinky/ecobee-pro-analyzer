@@ -1,4 +1,4 @@
-import streamlit as stimport streamlit as st
+import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -311,5 +311,4 @@ if uploaded_file is not None:
     else:
         st.error("Could not process the uploaded CSV file. Please check file format.")
 else:
-    st.info("Upload your Ecobee CSV data export to begin the analysis.")
     st.info("Upload your Ecobee CSV data export to begin the analysis.")
