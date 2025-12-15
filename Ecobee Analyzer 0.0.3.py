@@ -14,13 +14,13 @@ def load_data(file):
     Loads and cleans data. Cached to prevent reloading on every interaction.
     """
     try:
-        # FIX 2: Changed skiprows=4 to skiprows=5 for robust header parsing.
+        # FIX: Changed skiprows=4 to skiprows=5 for robust header parsing (since you had 5 header rows).
         df = pd.read_csv(file, skiprows=5, index_col=False)
         df.columns = df.columns.str.strip()
         
         # Combine Date and Time and set as index
         if 'Date' in df.columns and 'Time' in df.columns:
-            # Handle potential NaN in Date/Time columns before combining
+            # Handle potential NaN in Date/Time columns before combining (robustness)
             df_cleaned = df.dropna(subset=['Date', 'Time']).copy()
             df_cleaned['DateTime'] = pd.to_datetime(df_cleaned['Date'] + ' ' + df_cleaned['Time'])
             df_cleaned = df_cleaned.set_index('DateTime')
@@ -41,26 +41,24 @@ def create_motion_timeline(df, columns, title="Motion / Occupancy Timeline"):
     for i, col in enumerate(columns):
         if col not in df.columns: continue
         # Filter for rows where motion/occupancy is detected (value is 1 or more)
-        # Assuming Ecobee uses 1.0 for detected or 0.0 for not detected
         motion = df[df[col] >= 1].index
         if motion.empty: continue
 
         # Logic to group adjacent 'motion' points into continuous blocks
         starts = []
         ends = []
-        cur_start = motion[0] if len(motion) > 0 else None
+        cur_start = motion[0]
 
-        if cur_start:
-            for j in range(1, len(motion)):
-                # Check for a gap longer than 10 minutes (Ecobee reports every 5 min)
-                if (motion[j] - motion[j-1]) > timedelta(minutes=10):
-                    starts.append(cur_start)
-                    ends.append(motion[j-1])
-                    cur_start = motion[j]
-            
-            # Add the final block
-            starts.append(cur_start)
-            ends.append(motion[-1])
+        for j in range(1, len(motion)):
+            # Check for a gap longer than 10 minutes (Ecobee reports every 5 min)
+            if (motion[j] - motion[j-1]) > timedelta(minutes=10):
+                starts.append(cur_start)
+                ends.append(motion[j-1])
+                cur_start = motion[j]
+        
+        # Add the final block
+        starts.append(cur_start)
+        ends.append(motion[-1])
 
         for s, e in zip(starts, ends):
             duration_minutes = round((e - s).total_seconds() / 60)
@@ -106,6 +104,10 @@ with st.sidebar:
     kwh_price = st.number_input("Electricity Rate ($/kWh)", value=0.14, step=0.01, format="%.2f", help="Your cost per kWh")
     hp_kw = st.number_input("Heat Pump Power (kW)", value=3.0, step=0.5, help="Heat pump power consumption")
     aux_kw = st.number_input("Aux Heat Power (kW)", value=5.0, step=0.5, help="Auxiliary/Emergency heat power consumption")
+    
+    # New input for the critical temperature threshold
+    T_crit = st.number_input("Aux Heat Critical Temp (°F)", value=40.0, step=1.0, help="Outdoor temp above which Aux Heat is considered unnecessary for efficiency scoring.")
+
 
 if uploaded_file is not None:
     df = load_data(uploaded_file)
@@ -113,55 +115,88 @@ if uploaded_file is not None:
     if df is not None:
         # --- COLUMN DETECTION ---
         all_cols = df.columns.tolist()
-        temp_cols = [c for c in all_cols if '(F)' in c]
+        temp_cols = [c for c in all_cols if '(F)' in c or 'Temp' in c] 
         motion_cols = [c for c in all_cols if 'Motion' in c or 'Occupancy' in c or c.endswith('2')]
-        
-        # FIX 1: Redefine aq_cols to separate VOC/CO2 from the AirQuality Index.
         voc_co2_cols = [c for c in ['Thermostat CO2ppm', 'Thermostat VOCppm'] if c in df.columns]
         aq_index_col = 'Thermostat AirQuality' if 'Thermostat AirQuality' in df.columns else None
-        
         run_cols = [c for c in ['Cool Stage 1 (sec)', 'Heat Stage 1 (sec)', 'Aux Heat 1 (sec)', 'Fan (sec)'] if c in df.columns]
 
         # --- SIDEBAR FILTERS ---
         with st.sidebar:
             st.header("3. Graph Filters")
             selected_rooms = st.multiselect("Temperature Sensors", temp_cols, 
-                                            default=[c for c in temp_cols if 'Thermostat' in c or 'Average' in c])
+                                            default=[c for c in temp_cols if 'Thermostat' in c or 'Current Temp' in c])
 
-        # === ENERGY REPORT ===
+        # === ENERGY REPORT (REVISED) ===
         st.header("⚡ Energy Efficiency Report")
         
+        # ----------------------------------------------------
+        # NEW: Contextualized Aux Heat Calculation
+        # ----------------------------------------------------
+        
+        # 1. Total Heating Time (All Temps)
         cool_min = df['Cool Stage 1 (sec)'].sum() / 60 if 'Cool Stage 1 (sec)' in df else 0
         heat_min = df['Heat Stage 1 (sec)'].sum() / 60 if 'Heat Stage 1 (sec)' in df else 0
         aux_min = df['Aux Heat 1 (sec)'].sum() / 60 if 'Aux Heat 1 (sec)' in df else 0
+        
         total_heating_min = heat_min + aux_min
-        aux_pct = (aux_min / total_heating_min * 100) if total_heating_min > 0 else 0
+        total_aux_pct = (aux_min / total_heating_min * 100) if total_heating_min > 0 else 0
 
-        # Calculate cost in hours (minutes / 60)
+        # Calculate cost
         aux_cost = (aux_min / 60) * aux_kw * kwh_price
         hp_cost = (heat_min / 60) * hp_kw * kwh_price
         total_cost = aux_cost + hp_cost
-
-        # Scoring Logic
-        if total_heating_min > 60:
-            if aux_pct < 5: score, color, grade = 95, "green", "A+ Excellent"
-            elif aux_pct < 15: score, color, grade = 85, "lightgreen", "A Good"
-            elif aux_pct < 30: score, color, grade = 70, "orange", "B Fair"
-            else: score, color, grade = 50, "red", "C Poor"
+        
+        # 2. Unnecessary Aux Heat (Above Critical Temperature)
+        if 'Outdoor Temp (F)' in df.columns and total_heating_min > 0:
+            # Filter data points where outdoor temperature is >= T_crit
+            df_warm = df[df['Outdoor Temp (F)'] >= T_crit]
+            
+            unnecessary_aux_min = df_warm['Aux Heat 1 (sec)'].sum() / 60
+            warm_hp_min = df_warm['Heat Stage 1 (sec)'].sum() / 60
+            warm_total_heat_min = unnecessary_aux_min + warm_hp_min
+            
+            # Calculate the percentage of Aux Heat run time in the "warm" zone
+            unnecessary_aux_pct = (unnecessary_aux_min / warm_total_heat_min * 100) if warm_total_heat_min > 0 else 0
+            
+            # Scoring Logic (Based on Unnecessary Aux %)
+            if warm_total_heat_min > 30: # Only score if there was meaningful heating above T_crit
+                if unnecessary_aux_pct < 5: score, color, grade = 95, "green", "A+ Excellent"
+                elif unnecessary_aux_pct < 15: score, color, grade = 85, "lightgreen", "A Good"
+                elif unnecessary_aux_pct < 30: score, color, grade = 70, "orange", "B Fair"
+                else: score, color, grade = 50, "red", "C Poor"
+            else:
+                score, color, grade = 80, "gray", "Not Enough Heating Above Critical Temp"
         else:
-            score, color, grade = 80, "gray", "Not Enough Data"
-
+            unnecessary_aux_pct = 0
+            score, color, grade = 80, "gray", "Data Missing"
+            
+        
+        # ----------------------------------------------------
+        # Metrics Display
+        # ----------------------------------------------------
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Heating Time", f"{total_heating_min/60:.1f} hrs")
-        c2.metric("Aux Heat %", f"{aux_pct:.1f}%", delta_color="inverse")
-        c3.metric("Est. Cost", f"${total_cost:.2f}")
-        c4.markdown(f"<div style='text-align:center'><b>Score</b><br><span style='font-size:40px;color:{color}'>{score}</span><br>{grade}</div>", unsafe_allow_html=True)
-
+        c1.metric("Total Heating Time", f"{total_heating_min/60:.1f} hrs", help="Total Heat Pump + Aux Heat run time.")
+        c2.metric("Total Aux Heat %", f"{total_aux_pct:.1f}%", help="Total Aux Heat run time as a percentage of total heating. (This value is expected to be high in deep winter.)")
+        c3.metric(f"Unnecessary Aux % (>{T_crit}°F)", f"{unnecessary_aux_pct:.1f}%", delta_color="inverse", help="Aux Heat run time as a percentage of total heating when the outdoor temp was 40°F or warmer. This is the efficiency metric.")
+        c4.markdown(f"<div style='text-align:center'><b>Efficiency Grade</b><br><span style='font-size:40px;color:{color}'>{score}</span><br>{grade}</div>", unsafe_allow_html=True)
+        st.metric("Est. Cost", f"${total_cost:.2f}", help="Estimated cost based on your inputs.")
+        
         st.subheader("Recommendations")
         tips = []
-        if aux_pct > 30: tips.append("High aux heat → Consider cold-climate heat pump or insulation upgrades")
-        elif aux_pct > 15: tips.append("Raise Aux Heat lockout temp in Ecobee settings")
-        if total_cost > 50: tips.append("High cost → Use schedule setbacks when away")
+        
+        # Recommendations based on the new efficiency metric
+        if grade in ["C Poor", "B Fair"]:
+            tips.append(f"High unnecessary Aux usage (>{T_crit}°F) → **Check your Ecobee threshold settings**.")
+            tips.append("Action: Adjust `Aux Heat Max Outdoor Temperature` down to $35^\circ\text{F}$ (or lower) to prevent it from running when the heat pump can manage.")
+        elif grade == "A Good":
+            tips.append("Good efficiency in mild temperatures. If you want to optimize further, you can try lowering your `Aux Heat Max Outdoor Temperature` slightly, or check for large thermostat changes that trigger Aux.")
+        elif grade == "A+ Excellent":
+            tips.append("Excellent performance! Your Ecobee thresholds are set very well, or your heat pump is highly efficient.")
+            
+        # General cost recommendations
+        if total_cost > 50: tips.append("High overall cost → Use aggressive schedule setbacks (lower temp) when you are away from home or sleeping.")
+        
         if not tips: tips.append("Your system is running efficiently!")
         for t in tips: st.success(t)
 
@@ -170,8 +205,7 @@ if uploaded_file is not None:
         # === TEMPERATURE ===
         st.header("🌡️ Temperature Profiles")
         if selected_rooms:
-            # Resample must be called on a copy slice to avoid SettingWithCopyWarning
-            plot_df = df[selected_rooms].resample('5min').mean().copy()
+            plot_df = df[selected_rooms].resample('5min').mean()
             fig = px.line(plot_df, render_mode='webgl')
             
             if 'Heat Set Temp (F)' in df.columns:
@@ -189,9 +223,12 @@ if uploaded_file is not None:
         # === HVAC RUNTIME ===
         st.header("⚙️ System Runtime")
         if run_cols:
-            fig = px.area(df[run_cols].copy() / 60, title="HVAC Runtime (Minutes per 5-min block)",
-                          color_discrete_sequence=['#FF97FF', '#FF6692', '#EF553B', '#636EFA'])
-            fig.update_layout(hovermode="x unified", yaxis_title="Minutes On", legend_title="Equipment")
+            # IMPROVEMENT: Use bar chart for discrete runtime accumulation per block
+            runtime_df = df[run_cols].copy() / 60
+            fig = px.bar(runtime_df, 
+                         title="HVAC Runtime (Minutes per 5-min block)",
+                         color_discrete_sequence=['#FF97FF', '#FF6692', '#EF553B', '#636EFA'])
+            fig.update_layout(hovermode="x unified", yaxis_title="Minutes On", legend_title="Equipment", barmode='stack')
             st.plotly_chart(fig, use_container_width=True)
 
         # === AIR QUALITY (VOC and CO2) ===
@@ -206,7 +243,7 @@ if uploaded_file is not None:
         # === AIR QUALITY INDEX (The 241k value) ===
         st.header("📊 Air Quality Index Score")
         if aq_index_col:
-            # Tweak: Use a bar chart for an index/score to emphasize discrete values
+            # Displaying the Air Quality Index separately
             fig = px.bar(df, x=df.index, y=aq_index_col, title="Air Quality Index Score Trend (The '241k' value)")
             fig.update_layout(hovermode="x unified", yaxis_title="Air Quality Index (Score)", showlegend=False)
             st.plotly_chart(fig, use_container_width=True)
@@ -263,17 +300,13 @@ if uploaded_file is not None:
                 st.info("No indoor humidity data found.")
 
         # ==========================================
-        # === ROOM BALANCING SCORES (No changes needed) ===
+        # === ROOM BALANCING SCORES ===
         # ==========================================
         st.divider()
         st.header("⚖️ Room Temperature Balancing")
         
-        # Identify Room Sensors (exclude Outdoor, Setpoints, Min/Max columns)
         room_cols = [c for c in temp_cols if 'Outdoor' not in c and 'Set Temp' not in c and 'Zone' not in c]
-        
-        # Try to identify the Main Thermostat to use as a baseline
-        # Ecobee usually names it 'Thermostat Temperature (F)'
-        thermostat_col = next((c for c in room_cols if 'Thermostat' in c), None)
+        thermostat_col = next((c for c in room_cols if 'Thermostat' in c or 'Current Temp' in c), None)
 
         if thermostat_col and len(room_cols) > 1:
             st.write(f"Comparing all rooms against **{thermostat_col}** (Baseline).")
@@ -284,7 +317,7 @@ if uploaded_file is not None:
             
             # 2. Calculate Offsets (Room - Thermostat)
             offsets = avg_temps - baseline_temp
-            offsets = offsets.drop(thermostat_col) # Remove the baseline itself from the chart
+            offsets = offsets.drop(thermostat_col, errors='ignore') # Remove the baseline itself from the chart
             
             # 3. Create DataFrame for Plotting
             score_df = pd.DataFrame({'Sensor': offsets.index, 'Offset': offsets.values})
