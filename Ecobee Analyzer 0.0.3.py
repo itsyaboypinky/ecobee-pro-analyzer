@@ -14,15 +14,17 @@ def load_data(file):
     Loads and cleans data. Cached to prevent reloading on every interaction.
     """
     try:
-        # Load CSV (Ecobee headers usually start on row 5, so skiprows=4)
-        df = pd.read_csv(file, skiprows=4, index_col=False)
+        # FIX 2: Changed skiprows=4 to skiprows=5 for robust header parsing.
+        df = pd.read_csv(file, skiprows=5, index_col=False)
         df.columns = df.columns.str.strip()
         
         # Combine Date and Time and set as index
         if 'Date' in df.columns and 'Time' in df.columns:
-            df['DateTime'] = pd.to_datetime(df['Date'] + ' ' + df['Time'])
-            df = df.set_index('DateTime')
-            return df
+            # Handle potential NaN in Date/Time columns before combining
+            df_cleaned = df.dropna(subset=['Date', 'Time']).copy()
+            df_cleaned['DateTime'] = pd.to_datetime(df_cleaned['Date'] + ' ' + df_cleaned['Time'])
+            df_cleaned = df_cleaned.set_index('DateTime')
+            return df_cleaned
         else:
             return None
     except Exception as e:
@@ -39,24 +41,26 @@ def create_motion_timeline(df, columns, title="Motion / Occupancy Timeline"):
     for i, col in enumerate(columns):
         if col not in df.columns: continue
         # Filter for rows where motion/occupancy is detected (value is 1 or more)
+        # Assuming Ecobee uses 1.0 for detected or 0.0 for not detected
         motion = df[df[col] >= 1].index
         if motion.empty: continue
 
         # Logic to group adjacent 'motion' points into continuous blocks
         starts = []
         ends = []
-        cur_start = motion[0]
+        cur_start = motion[0] if len(motion) > 0 else None
 
-        for j in range(1, len(motion)):
-            # Check for a gap longer than 10 minutes (Ecobee reports every 5 min)
-            if (motion[j] - motion[j-1]) > timedelta(minutes=10):
-                starts.append(cur_start)
-                ends.append(motion[j-1])
-                cur_start = motion[j]
-        
-        # Add the final block
-        starts.append(cur_start)
-        ends.append(motion[-1])
+        if cur_start:
+            for j in range(1, len(motion)):
+                # Check for a gap longer than 10 minutes (Ecobee reports every 5 min)
+                if (motion[j] - motion[j-1]) > timedelta(minutes=10):
+                    starts.append(cur_start)
+                    ends.append(motion[j-1])
+                    cur_start = motion[j]
+            
+            # Add the final block
+            starts.append(cur_start)
+            ends.append(motion[-1])
 
         for s, e in zip(starts, ends):
             duration_minutes = round((e - s).total_seconds() / 60)
@@ -111,7 +115,11 @@ if uploaded_file is not None:
         all_cols = df.columns.tolist()
         temp_cols = [c for c in all_cols if '(F)' in c]
         motion_cols = [c for c in all_cols if 'Motion' in c or 'Occupancy' in c or c.endswith('2')]
-        aq_cols = [c for c in ['Thermostat CO2ppm', 'Thermostat VOCppm', 'Thermostat AirQuality'] if c in df.columns]
+        
+        # FIX 1: Redefine aq_cols to separate VOC/CO2 from the AirQuality Index.
+        voc_co2_cols = [c for c in ['Thermostat CO2ppm', 'Thermostat VOCppm'] if c in df.columns]
+        aq_index_col = 'Thermostat AirQuality' if 'Thermostat AirQuality' in df.columns else None
+        
         run_cols = [c for c in ['Cool Stage 1 (sec)', 'Heat Stage 1 (sec)', 'Aux Heat 1 (sec)', 'Fan (sec)'] if c in df.columns]
 
         # --- SIDEBAR FILTERS ---
@@ -129,6 +137,7 @@ if uploaded_file is not None:
         total_heating_min = heat_min + aux_min
         aux_pct = (aux_min / total_heating_min * 100) if total_heating_min > 0 else 0
 
+        # Calculate cost in hours (minutes / 60)
         aux_cost = (aux_min / 60) * aux_kw * kwh_price
         hp_cost = (heat_min / 60) * hp_kw * kwh_price
         total_cost = aux_cost + hp_cost
@@ -161,7 +170,8 @@ if uploaded_file is not None:
         # === TEMPERATURE ===
         st.header("🌡️ Temperature Profiles")
         if selected_rooms:
-            plot_df = df[selected_rooms].resample('5min').mean()
+            # Resample must be called on a copy slice to avoid SettingWithCopyWarning
+            plot_df = df[selected_rooms].resample('5min').mean().copy()
             fig = px.line(plot_df, render_mode='webgl')
             
             if 'Heat Set Temp (F)' in df.columns:
@@ -184,14 +194,25 @@ if uploaded_file is not None:
             fig.update_layout(hovermode="x unified", yaxis_title="Minutes On", legend_title="Equipment")
             st.plotly_chart(fig, use_container_width=True)
 
-        # === AIR QUALITY ===
-        st.header("💨 Air Quality & CO₂")
-        if aq_cols:
-            fig = px.line(df[aq_cols], title="Air Quality Trends")
-            fig.update_layout(hovermode="x unified", yaxis_title="Level (ppb / ppm)", legend_title="Reading")
+        # === AIR QUALITY (VOC and CO2) ===
+        st.header("💨 Air Quality - VOC & Estimated CO₂")
+        if voc_co2_cols:
+            fig = px.line(df[voc_co2_cols], title="VOC (ppb) and Estimated CO₂ (ppm) Trends")
+            fig.update_layout(hovermode="x unified", yaxis_title="Concentration (ppb / ppm)", legend_title="Reading")
             st.plotly_chart(fig, use_container_width=True)
         else:
-            st.info("No air quality data found (available only on Ecobee Premium models).")
+            st.info("No VOC or CO₂ data found (available only on Ecobee Premium models).")
+
+        # === AIR QUALITY INDEX (The 241k value) ===
+        st.header("📊 Air Quality Index Score")
+        if aq_index_col:
+            # Tweak: Use a bar chart for an index/score to emphasize discrete values
+            fig = px.bar(df, x=df.index, y=aq_index_col, title="Air Quality Index Score Trend (The '241k' value)")
+            fig.update_layout(hovermode="x unified", yaxis_title="Air Quality Index (Score)", showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No Air Quality Index data found.")
+            
 
         # === MOTION TIMELINE ===
         st.header("🏃 Motion Detection Timeline")
@@ -217,7 +238,9 @@ if uploaded_file is not None:
                 fig_out.add_trace(go.Scatter(x=df.index, y=df['Outdoor Temp (F)'], name='Outdoor Temp (°F)', line=dict(color='orange', width=2.5), yaxis='y1'))
                 has_outdoor = True
             if 'Wind Speed (km/h)' in df.columns:
-                fig_out.add_trace(go.Scatter(x=df.index, y=df['Wind Speed (km/h)'], name='Wind Speed (km/h)', yaxis='y2', line=dict(color='gray', width=2, dash='dot')))
+                # Use mean on 5min resample to smooth the line if the original data is sporadic
+                wind_speed = df['Wind Speed (km/h)'].resample('5min').mean()
+                fig_out.add_trace(go.Scatter(x=wind_speed.index, y=wind_speed, name='Wind Speed (km/h)', yaxis='y2', line=dict(color='gray', width=2, dash='dot')))
                 has_outdoor = True
             
             if has_outdoor:
@@ -240,7 +263,7 @@ if uploaded_file is not None:
                 st.info("No indoor humidity data found.")
 
         # ==========================================
-        # === NEW SECTION: ROOM BALANCING SCORES ===
+        # === ROOM BALANCING SCORES (No changes needed) ===
         # ==========================================
         st.divider()
         st.header("⚖️ Room Temperature Balancing")
