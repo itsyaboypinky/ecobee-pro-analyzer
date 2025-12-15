@@ -244,27 +244,54 @@ if uploaded_file is not None:
             fig.update_layout(hovermode="x unified", yaxis_title="Minutes On", legend_title="Equipment", barmode='stack')
             st.plotly_chart(fig, use_container_width=True)
 
-        # === AIR QUALITY (FIXED) ===
+        # === AIR QUALITY ANALYSIS (CORRECTED) ===
         st.header("💨 Air Quality Analysis")
-        voc_col = 'Thermostat VOCppm' if 'Thermostat VOCppm' in df.columns else None
-        co2_col = 'Thermostat CO2ppm' if 'Thermostat CO2ppm' in df.columns else None
-
-        if voc_col or co2_col:
-            fig = make_subplots(specs=[[{"secondary_y": True}]])
-            if voc_col:
-                max_voc = df[voc_col].max()
-                fig.add_trace(go.Scatter(x=df.index, y=df[voc_col], name="VOC (ppb)", line=dict(color='#EF553B', width=2)), secondary_y=False)
-                if max_voc > 5000: st.warning(f"⚠️ High VOC Spike detected: **{max_voc:,.0f} ppb**. This was previously hidden by column misalignment.")
+        
+        # 1. Identify the REAL Air Quality Column
+        # We look for the column that has realistic air quality values (400 - 5000 range)
+        # We explicitly IGNORE any column with values > 10,000 (which are Pressure/Errors)
+        
+        valid_aq_col = None
+        
+        # Candidates to check
+        candidates = ['Thermostat CO2ppm', 'Thermostat VOCppm', 'Thermostat AirQuality']
+        
+        for col in candidates:
+            if col in df.columns:
+                col_mean = df[col].mean()
+                # Realistic Air Quality is usually between 400 and 5000
+                if 300 < col_mean < 8000:
+                    valid_aq_col = col
+                    break
+        
+        if valid_aq_col:
+            st.info(f"Analyzing Air Quality using column: **{valid_aq_col}** (Values ~{int(df[valid_aq_col].mean())})")
             
-            if co2_col:
-                fig.add_trace(go.Scatter(x=df.index, y=df[co2_col], name="CO2 (ppm)", line=dict(color='#00CC96', width=2, dash='solid')), secondary_y=True)
-
-            fig.update_layout(title="<b>VOC (Left)</b> vs <b>CO₂ (Right)</b>", hovermode="x unified", legend=dict(orientation="h", y=1.1))
-            fig.update_yaxes(title_text="VOC (ppb)", title_font=dict(color="#EF553B"), secondary_y=False)
-            fig.update_yaxes(title_text="CO₂ (ppm)", title_font=dict(color="#00CC96"), secondary_y=True)
+            # Simple, clean line chart
+            fig = px.line(df, x=df.index, y=valid_aq_col, 
+                          title="Estimated Air Quality Levels (CO₂ Equivalent)",
+                          markers=True)
+            
+            # Add color zones for context
+            fig.add_hrect(y0=0, y1=1000, line_width=0, fillcolor="green", opacity=0.1, annotation_text="Excellent")
+            fig.add_hrect(y0=1000, y1=2000, line_width=0, fillcolor="yellow", opacity=0.1, annotation_text="Fair")
+            fig.add_hrect(y0=2000, y1=5000, line_width=0, fillcolor="red", opacity=0.1, annotation_text="Poor")
+            
+            fig.update_layout(
+                yaxis_title="CO₂ Equivalent (ppm)",
+                xaxis_title="Time",
+                hovermode="x unified"
+            )
             st.plotly_chart(fig, use_container_width=True)
+            
+            # Insight about the sensor
+            st.caption("Note: Ecobee uses a VOC sensor to 'estimate' CO₂ levels. High values here actually represent high VOCs (odors, chemicals, stuffiness).")
+            
         else:
-            st.info("No Air Quality data found.")
+            st.warning("Could not find valid Air Quality data (Values between 400-5000). The available columns seem to contain Error or Pressure data.")
+            # Debugging view to show the user what we found
+            st.write("Data detected in columns (for debugging):")
+            st.write(df[candidates].describe())
 
         # === MOTION TIMELINE ===
         st.header("🏃 Motion Detection Timeline")
@@ -317,3 +344,4 @@ if uploaded_file is not None:
             fig_bal = px.bar(score_df, x='Offset', y='Sensor', orientation='h', color='Offset', color_continuous_scale='RdBu_r', text_auto='.1f', title=f"Offset vs {thermostat_col}")
             fig_bal.add_vline(x=0, line_color="black")
             st.plotly_chart(fig_bal, use_container_width=True)
+
